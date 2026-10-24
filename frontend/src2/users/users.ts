@@ -1,6 +1,5 @@
-import { call } from 'frappe-ui'
+import { call, toast } from 'frappe-ui'
 import { reactive, ref } from 'vue'
-import { createToast } from '../helpers/toasts'
 import { showErrorToast } from '../helpers'
 import { __ } from '../translation'
 
@@ -26,6 +25,21 @@ async function getUsers(search_term = '') {
 	})
 }
 
+// a search result is a slice of the roster, so it is merged in rather than
+// swapped for it - names already on screen must survive the next keystroke
+const searching = ref(false)
+async function searchUsers(search_term = '') {
+	searching.value = true
+	return call('insights.api.user.get_users', { search_term })
+		.then((res) => {
+			const matches = res as User[]
+			const known = new Set(users.value.map((u) => u.email))
+			users.value = users.value.concat(matches.filter((u) => !known.has(u.email)))
+			return matches
+		})
+		.finally(() => (searching.value = false))
+}
+
 function getUser(email: string) {
 	return users.value.find((user) => user.email === email)
 }
@@ -44,13 +58,11 @@ function inviteUsers(emails: string[]) {
 	return call('insights.api.user.invite_users', { emails: emails.join(',') })
 		.then(() => {
 			getUsers()
-			createToast({
-				title: __('Invitation Sent'),
-				message:
+			toast.success(__('Invitation Sent'), {
+				description:
 					emails.length === 1
 						? __(`Invitation sent to {0}`, emails[0])
 						: __(`Invitations sent to {0} users`, String(emails.length)),
-				variant: 'success',
 			})
 		})
 		.catch((e: Error) => {
@@ -77,10 +89,8 @@ function updateUser(email: string, data: Partial<UpdateUser>) {
 	})
 		.then(() => {
 			getUsers()
-			createToast({
-				title: __('User Updated'),
-				message: __('User updated successfully'),
-				variant: 'success',
+			toast.success(__('User Updated'), {
+				description: __('User updated successfully'),
 			})
 		})
 		.catch((e: Error) => {
@@ -100,6 +110,8 @@ export default function useUserStore() {
 		users,
 		loading,
 		getUsers,
+		searchUsers,
+		searching,
 		getUser,
 		getName,
 		getImage,

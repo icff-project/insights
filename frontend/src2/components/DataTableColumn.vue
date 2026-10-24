@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Button, Dropdown } from 'frappe-ui'
 import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, XIcon } from 'lucide-vue-next'
 import { h, ref, watchEffect } from 'vue'
 import { SortDirection } from '../types/query.types'
@@ -40,7 +41,7 @@ const sortOptions = [
 		<ContentEditable
 			v-model="_label"
 			:placeholder="__('Column')"
-			class="flex h-6 items-center whitespace-nowrap rounded-sm px-0.5 text-sm-medium first:ml-2 focus:ring-1 focus:ring-outline-gray-6 focus:ring-offset-1"
+			class="!h-6 !px-0.5 whitespace-nowrap text-sm-medium first:ml-2"
 			:disabled="!props.onRename"
 			@returned="props.onRename?.(_label)"
 			@blur="props.onRename?.(_label)"

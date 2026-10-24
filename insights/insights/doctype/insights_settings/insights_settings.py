@@ -27,7 +27,6 @@ class InsightsSettings(Document):
 
         allow_subquery: DF.Check
         allowed_origins: DF.Data | None
-        apply_user_permissions: DF.Check
         auto_execute_query: DF.Check
         enable_data_store: DF.Check
         enable_permissions: DF.Check
@@ -59,10 +58,3 @@ class InsightsSettings(Document):
         if hasattr(settings, "telegram_api_token"):
             self.telegram_api_token = settings.telegram_api_token
         self.save()
-
-    @property
-    def is_subscribed(self):
-        try:
-            return 1 if frappe.conf.sk_insights else 0
-        except Exception:
-            return None

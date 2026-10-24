@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory, RouteLocation } from 'vue-router'
+import { createRouter, createWebHistory } from 'vue-router'
 import { APP_PATH } from './app_path.ts'
 import session from './session.ts'
 
@@ -57,13 +57,6 @@ const routes = [
 				component: () => import('./workbook/WorkbookDashboard.vue'),
 			},
 		],
-	},
-	{
-		props: true,
-		name: 'OpenTemplate',
-		path: '/template/:app/:folder',
-		component: () => import('./workbook/OpenTemplate.vue'),
-		meta: { hideSidebar: true },
 	},
 	{
 		path: '/data-source',

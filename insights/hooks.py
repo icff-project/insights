@@ -15,7 +15,10 @@ require_type_annotated_api_methods = True
 # Sites that already serve something at /insights (e.g. a website page) can move
 # the app elsewhere by setting `insights_path` in site config. Stored without
 # slashes so everything below can build paths as f"/{insights_path}".
-insights_path = (frappe.conf.insights_path or "insights").strip("/") or "insights"
+# `website_route_rules` and `add_to_apps_screen` are plain module-level data, so
+# the path has to be known at import time; a bench process serving several sites
+# takes the value of whichever site imported this module first.
+insights_path = (frappe.conf.insights_path or "insights").strip("/") or "insights"  # nosemgrep
 
 add_to_apps_screen = [
     {
@@ -27,21 +30,14 @@ add_to_apps_screen = [
     }
 ]
 
-# Any app can ship workbooks to Insights by pointing this hook at a directory
-# (relative to the app) holding one folder per workbook — manifest.json +
-# workbook.json + optional preview.png. Insights is its own first consumer: the
-# bundled ERPNext workbooks are discovered through the same public contract.
-# Deliberately policy-free name: how the site consumes these (import a copy
-# today, versioned updates later) can evolve without breaking the hook.
-insights_workbooks = "workbook_templates"
-
-
 # Includes in <head>
 # ------------------
 
 # include js, css files in header of desk.html
 # app_include_css = "/assets/insights/css/insights.css"
-app_include_js = "insights_nudge.bundle.js"
+
+# a desk page with an island needs the app's mount path to build links
+extend_bootinfo = "insights.desk.boot_app_path"
 
 # include js, css files in header of web template
 # web_include_css = "/assets/insights/css/insights.css"
@@ -95,6 +91,7 @@ app_include_js = "insights_nudge.bundle.js"
 # before_install = "insights.install.before_install"
 after_install = "insights.migrate.after_migrate"
 after_migrate = "insights.migrate.after_migrate"
+after_app_install = "insights.migrate.after_app_install"
 
 after_request = ["insights.insights.doctype.insights_data_source_v3.insights_data_source_v3.after_request"]
 
@@ -130,6 +127,7 @@ permission_query_conditions = {
     "Insights Chart v3": "insights.permissions.get_permission_query_conditions",
     "Insights Dashboard v3": "insights.permissions.get_permission_query_conditions",
     "Insights Alert": "insights.permissions.get_permission_query_conditions",
+    "Insights Folder": "insights.permissions.get_permission_query_conditions",
 }
 
 has_permission = {
@@ -141,6 +139,7 @@ has_permission = {
     "Insights Chart v3": "insights.permissions.has_doc_permission",
     "Insights Dashboard v3": "insights.permissions.has_doc_permission",
     "Insights Alert": "insights.permissions.has_doc_permission",
+    "Insights Folder": "insights.permissions.has_doc_permission",
 }
 
 # DocType Class
@@ -158,7 +157,23 @@ has_permission = {
 doc_events = {
     "User": {
         "on_change": "insights.insights.doctype.insights_team.insights_team.update_admin_team",
-    }
+    },
+    # a desk document that links to Insights content renders through an
+    # Insights island — see insights/desk.py
+    "Dashboard": {
+        "onload": "insights.desk.claim",
+    },
+    "Dashboard Chart": {
+        "onload": "insights.desk.claim",
+    },
+    "DocShare": {
+        "validate": "insights.permissions.validate_member_share",
+    },
+    # child tables of workbook members
+    ("Insights Dashboard Chart v3", "Has Role", "Insights Query Variable"): {
+        "validate": "insights.permissions.refuse_member_row_alone",
+        "on_trash": "insights.permissions.refuse_member_row_alone",
+    },
 }
 
 # Scheduled Tasks
@@ -167,9 +182,10 @@ doc_events = {
 scheduler_events = {
     "all": [
         "insights.insights.doctype.insights_alert.insights_alert.send_alerts",
+        "insights.api.data_store.sync_tables",
     ],
     "daily": [
-        "insights.api.data_store.sync_tables",
+        "insights.telemetry_scan.run_site_scan",
     ],
     "weekly": [
         "insights.insights.doctype.insights_data_source_v3.data_warehouse.cleanup_data_store",
@@ -178,6 +194,10 @@ scheduler_events = {
         "insights.api.data_store.update_failed_sync_status",
         "insights.insights.doctype.insights_table_import_job.insights_table_import_job.run_scheduled_imports",
     ],
+}
+
+default_log_clearing_doctypes = {
+    "Insights Query Execution Log": 90,
 }
 
 # Testing
@@ -241,3 +261,9 @@ website_route_rules = [
     {"from_route": f"/{insights_path}/<path:app_path>", "to_route": "_insights"},
     {"from_route": f"/{insights_path}", "to_route": "_insights"},
 ]
+
+standard_queries = {
+    "Insights Query v3": "insights.api.search.search_workbook_items",
+    "Insights Chart v3": "insights.api.search.search_workbook_items",
+    "Insights Dashboard v3": "insights.api.search.search_workbook_items",
+}

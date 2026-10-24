@@ -1,6 +1,6 @@
+import { toast } from 'frappe-ui'
 import useDocumentResource from '../helpers/resource'
 import { __ } from '../translation'
-import { createToast } from '../helpers/toasts'
 
 let settings = undefined as Settings | undefined
 export default function useSettings() {
@@ -17,22 +17,20 @@ function makeSettings() {
 			owner: '',
 			enable_permissions: false,
 			allow_download: true,
+			max_export_rows: 100_000,
 			allowed_origins: '',
 			max_records_to_sync: 10_00_000,
 			max_memory_usage: 512,
 			fiscal_year_start: '',
 			week_starts_on: 'Monday',
 			enable_data_store: false,
-			apply_user_permissions: false,
 		},
 		disableLocalStorage: true,
 	})
 	_settings.onAfterSave(() =>
-		createToast({
-			title: __('Settings Updated'),
-			message: __('Your settings have been updated successfully'),
-			variant: 'success',
-		})
+		toast.success(__('Settings Updated'), {
+			description: __('Your settings have been updated successfully'),
+		}),
 	)
 	settings = _settings
 	return _settings
@@ -46,11 +44,11 @@ type InsightsSettings = {
 	owner: string
 	enable_permissions: boolean
 	allow_download: boolean
+	max_export_rows: number
 	allowed_origins: string
 	max_records_to_sync: number
 	max_memory_usage: number
 	fiscal_year_start: string
 	week_starts_on: string
 	enable_data_store: boolean
-	apply_user_permissions: boolean
 }

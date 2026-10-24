@@ -1,11 +1,15 @@
-import frappe
+from datetime import datetime
 
-from insights.decorators import insights_whitelist, validate_type
+import frappe
+from croniter import croniter
+from frappe.query_builder.functions import Max
+from frappe.utils import now_datetime
+
+from insights.decorators import insights_whitelist
 from insights.insights.doctype.insights_table_v3.insights_table_v3 import get_table_name
 
 
 @insights_whitelist()
-@validate_type
 def get_data_store_tables(data_source: str | None = None, search_term: str | None = None, limit: int = 100):
     filters = {"stored": 1}
     if data_source:
@@ -49,8 +53,7 @@ def get_data_store_tables(data_source: str | None = None, search_term: str | Non
     return ret
 
 
-@insights_whitelist(role="Insights Admin")
-@validate_type
+@insights_whitelist(role="Insights Admin", methods=["POST"])
 def import_table(data_source: str, table_name: str):
     name = get_table_name(data_source, table_name)
     table_doc = frappe.get_doc("Insights Table v3", name)
@@ -58,15 +61,35 @@ def import_table(data_source: str, table_name: str):
 
 
 def sync_tables():
-    # called daily via hooks
+    """Import each stored table whose sync schedule is due.
+
+    Runs on every scheduler tick. Due counts from the table's newest import start,
+    not its last success, so a failing table waits for its next due time instead
+    of retrying on every tick.
+    """
     tables = frappe.get_all(
         "Insights Table v3",
         filters={"stored": 1},
-        fields=["name", "data_source", "table"],
+        fields=["data_source", "table", "sync_schedule", "creation"],
     )
 
+    Log = frappe.qb.DocType("Insights Table Import Log")
+    started = {
+        (row.data_source, row.table_name): row.started_at
+        for row in frappe.qb.from_(Log)
+        .select(Log.data_source, Log.table_name, Max(Log.started_at).as_("started_at"))
+        .groupby(Log.data_source, Log.table_name)
+        .run(as_dict=True)
+    }
+
+    now = now_datetime()
     for table in tables:
-        import_table(table.data_source, table.table)
+        last = started.get((table.data_source, table.table)) or table.creation
+        try:
+            if croniter(table.sync_schedule, last).get_next(datetime) <= now:
+                import_table(table.data_source, table.table)
+        except Exception:
+            frappe.log_error(title=f"Error scheduling import of {table.table}")
 
 
 def update_failed_sync_status():

@@ -1,10 +1,9 @@
 import { useStorage, watchDebounced } from '@vueuse/core'
-import { __ } from '../translation'
 import { isEqual } from 'es-toolkit'
 import { call } from 'frappe-ui'
 import { computed, reactive, ref, UnwrapRef } from 'vue'
-import { confirmDialog } from '../helpers/confirm_dialog'
 import { copy, showErrorToast, waitUntil, watchToggle } from './index'
+import { mergeWriteAnswer, takeBackRefusal } from './write_answer'
 // import json_diff from 'https://cdn.jsdelivr.net/npm/json-diff@1.0.6/+esm'
 
 type Document = {
@@ -35,9 +34,9 @@ type DocumentResourceOptions<T extends Document> = {
 export default function useDocumentResource<T extends Document>(
 	doctype: string,
 	name: string,
-	options: DocumentResourceOptions<T>
+	options: DocumentResourceOptions<T>,
 ) {
-	const doc = ref(options.initialDoc)
+	const doc = ref(copy(options.initialDoc))
 	const originalDoc = ref(copy(options.initialDoc))
 	const docname = ref(String(name))
 	const isLocal = ref(docname.value.startsWith('new-'))
@@ -59,24 +58,36 @@ export default function useDocumentResource<T extends Document>(
 
 	const transformFn = options.transform || ((doc: T) => doc)
 
-	const isDirty = computed(() => !isEqual(doc.value, originalDoc.value))
+	// Both sides go through `copy` because `originalDoc` is one: a key set to
+	// `undefined` is dropped by the clone and kept on the document, and a deep
+	// equality that counts keys then calls a document dirty that a save cannot
+	// clean — autoSave writes it, the response replaces the document, whatever
+	// wrote the `undefined` writes it again.
+	const isDirty = computed(() => !isEqual(copy(doc.value), originalDoc.value))
+
+	// A surface waits on this before it renders the document. A local document has
+	// nothing to load, so it is ready the moment it is made.
+	const isPending = computed(() => !isLoaded.value && !isLocal.value)
 
 	async function insertDoc() {
 		if (!isLocal.value) return
 		await executeHooks(lifecycleHooks.beforeInsert)
 
 		isSaving.value = true
+		const sentDoc = copy(removeMetaFields(doc.value))
 		const newDoc = await call(methods.insert, {
 			doc: {
 				doctype,
-				...removeMetaFields(doc.value),
+				...sentDoc,
 			},
 		})
 			.catch(showErrorToast)
 			.finally(() => (isSaving.value = false))
 
-		updateDocState(newDoc)
+		updateDocState(newDoc, sentDoc)
 		isLocal.value = false
+		// the document exists now, so a surface that waits for one may open on it
+		isLoaded.value = true
 		await executeHooks(lifecycleHooks.afterInsert)
 		return newDoc
 	}
@@ -102,21 +113,38 @@ export default function useDocumentResource<T extends Document>(
 
 		isSaving.value = false
 		await executeHooks(lifecycleHooks.afterSave)
+
 		return doc.value
 	}
 
 	async function updateDoc() {
 		isSaving.value = true
-		const newDoc = await call(methods.update, {
-			doctype,
-			name: docname.value,
-			fieldname: removeMetaFields(doc.value),
-		})
-			.catch(showErrorToast)
-			.finally(() => (isSaving.value = false))
-
-		if (newDoc) {
-			updateDocState(newDoc)
+		const sentDoc = copy(removeMetaFields(doc.value))
+		try {
+			const newDoc = await call(methods.update, {
+				doctype,
+				name: docname.value,
+				fieldname: sentDoc,
+			})
+			if (newDoc) {
+				updateDocState(newDoc, sentDoc)
+			}
+		} catch (error) {
+			// Under autosave, a rejected value would block every later save. The
+			// document stays dirty, each edit triggers another save, and the
+			// server rejects the same payload again. So the rejected value is
+			// reverted. A manual save has no such loop, so it keeps every edit.
+			// So does a request that never reached the server.
+			if (autoSave.value && isRefusal(error)) {
+				doc.value = takeBackRefusal(
+					{ ...doc.value },
+					originalDoc.value,
+					sentDoc,
+				) as typeof doc.value
+			}
+			showErrorToast(error as Error)
+		} finally {
+			isSaving.value = false
 		}
 	}
 
@@ -140,18 +168,19 @@ export default function useDocumentResource<T extends Document>(
 		isLoaded.value = true
 	}
 
-	async function callMethod(method: string, args: any = {}) {
+	// `showError: false` leaves the failure to a caller that knows whether it
+	// still matters, like a request the reader has already moved on from
+	async function callMethod(method: string, args: any = {}, { showError = true } = {}) {
 		isLoading.value = true
-		const response = await call(methods.call, {
+		const request = call(methods.call, {
 			method,
 			docs: {
 				...(doc.value || {}),
 				__islocal: isLocal.value,
 			},
 			args,
-		})
-			.catch(showErrorToast)
-			.finally(() => (isLoading.value = false))
+		}).finally(() => (isLoading.value = false))
+		const response = await (showError ? request.catch(showErrorToast) : request)
 		return response.message
 	}
 
@@ -165,9 +194,22 @@ export default function useDocumentResource<T extends Document>(
 			.finally(() => (isDeleting.value = false))
 	}
 
-	function updateDocState(newDoc: any) {
-		doc.value = transformFn({ ...newDoc }) as UnwrapRef<T>
-		originalDoc.value = copy(doc.value)
+	// `sentDoc` is the deep clone a write sent. Pass it and the answer is read
+	// as the receipt it is — see `mergeWriteAnswer`. Leave it out to replace the
+	// document, which is what a load wants.
+	function updateDocState(newDoc: any, sentDoc?: any) {
+		const currentDoc = removeMetaFields(doc.value)
+		const answer = transformFn({ ...newDoc }) as UnwrapRef<T>
+
+		// The answer says what the server holds, so it is the new baseline even
+		// where the document has moved past it.
+		originalDoc.value = copy(answer)
+
+		if (sentDoc) {
+			mergeWriteAnswer(currentDoc, answer, sentDoc)
+		}
+
+		doc.value = answer
 		docname.value = newDoc.name
 	}
 
@@ -176,9 +218,14 @@ export default function useDocumentResource<T extends Document>(
 	}
 
 	const setupAutoSave = () => {
-		watchToggle(isDirty, saveDoc, {
+		// Watch the document, not `isDirty`. `isDirty` is a boolean, so an edit
+		// that lands while a write is in flight leaves it true and raises no
+		// new edge. The document itself changes, so the debounce re-arms and
+		// the kept edit reaches the server.
+		watchToggle(doc, () => isDirty.value && saveDoc(), {
 			toggleCondition: () => autoSave.value && !isLocal.value,
 			immediate: true,
+			deep: true,
 			debounce: 1500,
 		})
 	}
@@ -194,7 +241,8 @@ export default function useDocumentResource<T extends Document>(
 
 		if (storage.value?.doc) {
 			const isStale =
-				new Date(doc.value.modified).getTime() > new Date(storage.value.doc.modified).getTime()
+				new Date(doc.value.modified).getTime() >
+				new Date(storage.value.doc.modified).getTime()
 
 			if (!isStale) {
 				doc.value = storage.value.doc
@@ -215,7 +263,7 @@ export default function useDocumentResource<T extends Document>(
 			{
 				immediate: true,
 				deep: true,
-			}
+			},
 		)
 	}
 
@@ -240,6 +288,7 @@ export default function useDocumentResource<T extends Document>(
 		islocal: isLocal,
 		loading: isLoading,
 		isloaded: isLoaded,
+		pending: isPending,
 		saving: isSaving,
 		deleting: isDeleting,
 		autoSave: autoSave,
@@ -255,14 +304,6 @@ export default function useDocumentResource<T extends Document>(
 		load: loadDoc,
 		call: callMethod,
 		delete: deleteDoc,
-
-		discard() {
-			confirmDialog({
-				title: __('Discard Changes'),
-				message: __('Are you sure you want to discard changes?'),
-				onSuccess: () => loadDoc(),
-			})
-		},
 	})
 }
 
@@ -280,6 +321,11 @@ const metaFields = [
 	'parentfield',
 	'parenttype',
 ]
+
+/** The server rejected the write with a permission or validation error. */
+function isRefusal(error: any) {
+	return error?.status === 403 || error?.status === 417
+}
 
 function removeMetaFields(doc: any) {
 	const newDoc = { ...doc }

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { TextInput } from 'frappe-ui'
+import { TextInput, Tooltip } from 'frappe-ui'
 import { __ } from '../../translation'
 import { Check, ChevronLeft, Edit, Plus, Settings, XIcon } from 'lucide-vue-next'
-import { computed, ref, watchEffect } from 'vue'
+import { computed, h, ref } from 'vue'
 import InlineFormControlLabel from '../../components/InlineFormControlLabel.vue'
+import { dialogs } from '../../helpers/confirm_dialog'
 import { FIELDTYPES } from '../../helpers/constants'
 import {
 	AggregationType,
@@ -16,16 +17,31 @@ import {
 } from '../../types/query.types'
 import NewMeasureSelectorDialog from './NewMeasureSelectorDialog.vue'
 
-const emit = defineEmits({ remove: () => true })
+const emit = defineEmits({ remove: () => true, 'dialog-open': () => true })
 const props = defineProps<{
 	label?: string
 	columnOptions: ColumnOption[]
 	enableFormat?: boolean
+	/** Width of the settings popover, for a `config-fields` slot that needs more. */
+	configWidth?: string
+	/**
+	 * Heads the measure's own settings "Value", for a `config-fields` slot that
+	 * adds headed sections of its own.
+	 */
+	valueHeading?: boolean
 }>()
+
+/**
+ * The settings popover holds a labeled row, so it is as wide as the widest
+ * control that row holds: the number format group, at 10rem, beside a label
+ * column of 30%. Narrower than this and the group runs past the edge.
+ */
+const CONFIG_WIDTH = '17rem'
 
 const formatOptions = [
 	{ label: __('Normal'), value: '' },
 	{ label: __('Percent'), value: 'percent' },
+	{ label: __('Currency'), value: 'currency' },
 ]
 
 // True when at least one available column is a pre-aggregated measure (i.e. it
@@ -46,11 +62,13 @@ const measure = defineModel<Measure>({
 	},
 })
 
+// An empty slot is a column measure nobody has filled in yet. Reading it as
+// neither kind is what made the picker write a measure the moment it mounted —
+// one autosave and two re-runs of the chart data for opening a chart.
 const columnMeasure = computed<ColumnMeasure | undefined>({
 	get() {
-		if ('column_name' in measure.value) {
-			return measure.value as ColumnMeasure
-		}
+		if ('expression' in measure.value) return
+		return measure.value as ColumnMeasure
 	},
 	set(value) {
 		measure.value = value!
@@ -92,51 +110,94 @@ function getAutoMeasureName(columnMeasure: ColumnMeasure) {
 		: `${columnMeasure.aggregation}_of_${columnMeasure.column_name}`
 }
 
-watchEffect(() => {
-	if (!columnMeasure.value && !expressionMeasure.value) {
-		resetMeasure()
-	}
+/**
+ * The aggregation the picker is showing, which is not always one the measure
+ * has.
+ *
+ * A source whose columns are already measures opens on the column list under
+ * `sum`, skipping the "pick a function" step that would otherwise name a column
+ * "sum of sum_of_revenue". That is what the picker shows, not what it stores:
+ * nothing is written until the author picks a column. A rule the picker wrote
+ * while it was setting itself up left every chart dirty for being opened — one
+ * autosave and two re-runs of the chart data.
+ */
+const shownAggregation = computed<AggregationType | ''>(() => {
+	const measureAggregation = columnMeasure.value?.aggregation
+	if (measureAggregation) return measureAggregation as AggregationType
+	return sourceHasMeasures.value && !userResetAggregation.value ? 'sum' : ''
 })
 
-// When the source columns include pre-aggregated measures, pre-select `sum` as
-// the aggregation so the picker opens straight to the column list — skipping
-// the "pick a function" step that would otherwise produce confusing
-// "sum of sum_of_revenue" labels.
-// We skip this if the user explicitly clicked back to pick a different function.
-watchEffect(() => {
-	if (!sourceHasMeasures.value) return
-	if (userResetAggregation.value) return
+/** The author picked a function. Still nothing to store: a function names no column. */
+function pickAggregation(aggregation: AggregationType) {
+	userResetAggregation.value = false
 	const cm = columnMeasure.value
-	if (cm && !cm.aggregation) {
-		cm.aggregation = 'sum'
-	}
-})
+	if (cm) cm.aggregation = aggregation
+}
 
-watchEffect(() => {
+/** The author picked a column. This is the write. */
+function pickColumn(option: ColumnOption) {
 	const cm = columnMeasure.value
 	if (!cm) return
 
+	cm.aggregation = shownAggregation.value
+	cm.column_name = option.value
+	cm.data_type = option.data_type as MeasureDataType
+
+	// The author's own label stands. Only the name this picker last wrote, or no
+	// name at all, is replaced.
 	const autoMeasureName = getAutoMeasureName(cm)
 	const hasDefaultLabel =
 		!cm.measure_name ||
 		cm.measure_name === autoMeasureName ||
 		cm.measure_name === lastAutoMeasureName.value
-
 	if (autoMeasureName && hasDefaultLabel) {
 		cm.measure_name = autoMeasureName
 		lastAutoMeasureName.value = autoMeasureName
 	}
-})
+}
 
-const showMeasureDialog = ref(false)
-function updateMeasure(measureExpression: ExpressionMeasure) {
-	measure.value = {
-		expression: measureExpression.expression,
-		measure_name: measureExpression.measure_name,
-		data_type: measureExpression.data_type,
-		format: measure.value.format,
+let dialogCount = 0
+
+/**
+ * The expression dialog is mounted at the app root, not under this picker: a
+ * picker can sit inside a popover — this one nests in the number card's
+ * settings — and a popover unmounts its content when it closes, taking a dialog
+ * rendered there with it. Every popover over the dialog closes first, this
+ * picker's own and, through `dialog-open`, the one it is nested in.
+ */
+function openMeasureDialog(closePopover: () => void) {
+	closePopover()
+	emit('dialog-open')
+
+	const dialog = h(NewMeasureSelectorDialog, {
+		key: `measure-expression-${++dialogCount}`,
+		modelValue: true,
+		columnOptions: props.columnOptions,
+		measure: expressionMeasure.value,
+		'onUpdate:modelValue': (open: boolean) => !open && closeMeasureDialog(),
+		onSelect: (measureExpression: ExpressionMeasure) => {
+			updateMeasure(measureExpression)
+			closeMeasureDialog()
+		},
+	})
+	function closeMeasureDialog() {
+		dialogs.value = dialogs.value.filter((mounted) => mounted !== dialog)
 	}
-	showMeasureDialog.value = false
+	dialogs.value.push(dialog)
+}
+
+/**
+ * Writes onto the measure the picker holds instead of emitting: by the time the
+ * dialog answers, the popover can have unmounted the picker, and an emit from an
+ * unmounted picker reaches nobody.
+ */
+function updateMeasure(measureExpression: ExpressionMeasure) {
+	const written = measure.value as Partial<ColumnMeasure> & Partial<ExpressionMeasure>
+	delete written.column_name
+	delete written.aggregation
+	written.expression = measureExpression.expression
+	written.measure_name = measureExpression.measure_name
+	written.data_type = measureExpression.data_type
 }
 
 const aggregationOptions: { label: string; value: AggregationType }[] = [
@@ -145,11 +206,11 @@ const aggregationOptions: { label: string; value: AggregationType }[] = [
 	{ label: __('Average of...'), value: 'avg' },
 	{ label: __('Minimum of...'), value: 'min' },
 	{ label: __('Maximum of...'), value: 'max' },
-	{ label: __('Unique Count of...'), value: 'count_distinct' },
+	{ label: __('Unique count of...'), value: 'count_distinct' },
 ]
 
 const columnOptions = computed(() => {
-	const fn = (measure.value as ColumnMeasure).aggregation
+	const fn = shownAggregation.value
 	if (!fn) return []
 
 	return props.columnOptions.filter((column) => {
@@ -168,7 +229,16 @@ const filteredColumnOptions = computed(() => {
 	return columnOptions.value.filter((option) => option.label.toLowerCase().includes(query))
 })
 
-function getAggregationLabel(aggregation: AggregationType) {
+// a currency code is text, so only text columns are listed
+const currencyColumnOptions = computed(() => [
+	{ label: __('Site currency'), value: '' },
+	...props.columnOptions
+		.filter((column) => FIELDTYPES.TEXT.includes(column.data_type))
+		.map((column) => ({ label: column.label, value: column.value })),
+])
+
+function getAggregationLabel(aggregation: AggregationType | '') {
+	if (!aggregation) return undefined
 	return aggregationOptions.find((option) => option.value === aggregation)?.label
 }
 
@@ -181,15 +251,21 @@ function resetMeasure() {
 	}
 }
 
-// Called when the user explicitly clicks ChevronLeft to go back and pick a
-// different aggregation function. We set a flag so the watchEffect above doesn't
-// immediately re-fill `sum` and trap the user on the column list.
+// The author clicked back to pick a different function. The flag is what stops
+// `shownAggregation` from putting `sum` straight back and keeping them on the
+// column list.
 function resetAggregation() {
 	userResetAggregation.value = true
 	resetMeasure()
 }
 
-const label = ref(measure.value.measure_name)
+// An empty name would unmount these settings, whose trigger shows only for a
+// named measure.
+function rename(event: Event) {
+	const input = event.target as HTMLInputElement
+	if (input.value.trim()) measure.value.measure_name = input.value
+	else input.value = measure.value.measure_name
+}
 
 function handleRemove() {
 	measure.value = {
@@ -203,8 +279,8 @@ function handleRemove() {
 </script>
 
 <template>
-	<div class="flex items-end gap-1 overflow-hidden">
-		<div class="flex-1 overflow-hidden">
+	<div class="flex min-w-0 items-end gap-1">
+		<div class="min-w-0 flex-1">
 			<Popover bare match-trigger-width>
 				<template #trigger>
 					<div class="w-full space-y-1.5">
@@ -212,7 +288,7 @@ function handleRemove() {
 							{{ props.label }}
 						</div>
 						<button
-							class="flex h-7 w-full items-center justify-between gap-2 rounded bg-surface-gray-2 py-1 px-2 text-base transition-colors hover:bg-surface-gray-3 focus:ring-2 focus:ring-outline-gray-3"
+							class="flex h-7 w-full items-center justify-between gap-2 rounded-4 bg-surface-gray-2 py-1 px-2 text-base transition-colors hover:bg-surface-gray-3 focus:ring-2 focus:ring-outline-gray-3"
 						>
 							<div class="flex flex-1 items-center gap-2 overflow-hidden truncate">
 								<span v-if="measure.measure_name">
@@ -224,21 +300,18 @@ function handleRemove() {
 					</div>
 				</template>
 
-				<template #default="{ isOpen, toggle: togglePopover }">
+				<template #default="{ close }">
 					<div
-						class="relative mt-1 overflow-hidden rounded-lg bg-surface-base p-1.5 text-base shadow-2xl"
+						class="relative mt-1 overflow-hidden rounded-6 bg-surface-base p-1.5 text-base shadow-2xl"
 					>
 						<template v-if="columnMeasure && !expressionMeasure">
 							<span
-								v-if="!columnMeasure.aggregation"
+								v-if="!shownAggregation"
 								class="block px-1.5 py-0.5 text-p-xs text-ink-gray-5"
 							>
 								Select a Function
 							</span>
-							<div
-								v-else-if="columnMeasure.aggregation"
-								class="mb-1 flex items-center"
-							>
+							<div v-else class="mb-1 flex items-center">
 								<Button class="!h-6 !w-6" @click.prevent.stop="resetAggregation">
 									<template #icon>
 										<ChevronLeft
@@ -248,25 +321,19 @@ function handleRemove() {
 									</template>
 								</Button>
 								<span class="block px-1.5 py-0.5 text-p-xs text-ink-gray-5">
-									{{ getAggregationLabel(columnMeasure.aggregation) }}
+									{{ getAggregationLabel(shownAggregation) }}
 								</span>
 							</div>
 							<div class="flex max-h-[15rem] flex-col overflow-y-scroll">
-								<template v-if="!columnMeasure.aggregation">
+								<template v-if="!shownAggregation">
 									<div
 										v-for="option in aggregationOptions"
 										:key="option.value"
-										class="flex h-7 flex-shrink-0 cursor-pointer items-center justify-between rounded px-2.5 text-base hover:bg-surface-gray-2"
-										@click.prevent.stop="
-											() => {
-												if (!columnMeasure) return
-												columnMeasure.aggregation = option.value
-												userResetAggregation = false
-											}
-										"
+										class="flex h-7 flex-shrink-0 cursor-pointer items-center justify-between rounded-4 px-2.5 text-base hover:bg-surface-gray-2"
+										@click.prevent.stop="pickAggregation(option.value)"
 									>
 										<span>{{ option.label }}</span>
-										<span v-if="option.value === columnMeasure.aggregation">
+										<span v-if="option.value === shownAggregation">
 											<Check
 												class="h-4 w-4 text-ink-gray-6"
 												stroke-width="1.5"
@@ -275,25 +342,22 @@ function handleRemove() {
 									</div>
 								</template>
 
-								<template v-if="columnMeasure.aggregation">
-									<div class="sticky top-0 bg-surface-base space-y-1 p-1">
+								<template v-else>
+									<div class="sticky top-0 z-10 bg-surface-base space-y-1 p-1">
 										<TextInput
 											v-model="searchQuery"
-											placeholder="Search..."
+											:placeholder="__('Search...')"
 											autocomplete="off"
 										/>
 									</div>
 									<div
 										v-for="option in filteredColumnOptions"
 										:key="option.value"
-										class="flex h-7 flex-shrink-0 cursor-pointer items-center justify-between rounded px-2.5 text-base hover:bg-surface-gray-2"
+										class="flex h-7 flex-shrink-0 cursor-pointer items-center justify-between rounded-4 px-2.5 text-base hover:bg-surface-gray-2"
 										@click.prevent.stop="
 											() => {
-												;(measure as ColumnMeasure).column_name =
-													option.value
-												measure.data_type =
-													option.data_type as MeasureDataType
-												togglePopover()
+												pickColumn(option)
+												close()
 											}
 										"
 									>
@@ -316,8 +380,12 @@ function handleRemove() {
 							<Button
 								class="w-full"
 								variant="ghost"
-								:label="expressionMeasure ? 'Edit Expression' : 'Custom Expression'"
-								@click=";(showMeasureDialog = true), togglePopover()"
+								:label="
+									expressionMeasure
+										? __('Edit Expression')
+										: __('Custom Expression')
+								"
+								@click="openMeasureDialog(close)"
 							>
 								<template #prefix>
 									<component
@@ -340,19 +408,34 @@ function handleRemove() {
 					</template>
 				</Button>
 			</template>
-			<template #default>
-				<div class="flex w-[14rem] flex-col gap-2 p-2">
-					<InlineFormControlLabel label="Label">
+			<template #default="{ close: closeSettings }">
+				<div
+					class="flex max-h-[var(--reka-popover-content-available-height)] flex-col gap-2 overflow-y-auto p-2"
+					:style="{ width: props.configWidth || CONFIG_WIDTH }"
+				>
+					<div class="flex items-center gap-1">
 						<TextInput
+							class="flex-1"
 							autocomplete="off"
+							:aria-label="__('Label')"
 							:modelValue="measure.measure_name"
-							@update:modelValue="label = $event"
-							@blur="measure.measure_name = label"
-							@keydown.enter="measure.measure_name = label"
+							@change="rename"
 						/>
-					</InlineFormControlLabel>
+						<Tooltip :text="__('Remove')">
+							<Button
+								variant="ghost"
+								icon="lucide-trash-2"
+								:aria-label="__('Remove')"
+								@click="handleRemove"
+							/>
+						</Tooltip>
+					</div>
 
-					<InlineFormControlLabel v-if="props.enableFormat" label="Format">
+					<p v-if="props.valueHeading" class="mt-1 text-xs-medium text-ink-gray-8">
+						{{ __('Value') }}
+					</p>
+
+					<InlineFormControlLabel v-if="props.enableFormat" :label="__('Unit')">
 						<FormControl
 							type="select"
 							:options="formatOptions"
@@ -361,19 +444,19 @@ function handleRemove() {
 						/>
 					</InlineFormControlLabel>
 
-					<slot name="config-fields" />
+					<InlineFormControlLabel
+						v-if="props.enableFormat && measure.format === 'currency'"
+						:label="__('Currency from')"
+					>
+						<FormControl
+							type="select"
+							:options="currencyColumnOptions"
+							:modelValue="measure.currency_column || ''"
+							@update:modelValue="measure.currency_column = $event || undefined"
+						/>
+					</InlineFormControlLabel>
 
-					<div class="flex gap-1">
-						<Button
-							class="w-full"
-							variant="outline"
-							theme="red"
-							iconLeft="lucide-x"
-							@click="handleRemove"
-						>
-							Remove
-						</Button>
-					</div>
+					<slot name="config-fields" :close="closeSettings" />
 				</div>
 			</template>
 		</Popover>
@@ -383,13 +466,4 @@ function handleRemove() {
 			</template>
 		</Button>
 	</div>
-
-	<NewMeasureSelectorDialog
-		v-if="showMeasureDialog"
-		:model-value="Boolean(showMeasureDialog)"
-		@update:model-value="!$event && (showMeasureDialog = false)"
-		:column-options="props.columnOptions"
-		:measure="measure as ExpressionMeasure"
-		@select="updateMeasure"
-	/>
 </template>

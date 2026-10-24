@@ -1,5 +1,6 @@
 [pre_model_sync]
 insights.patches.check_legacy_v2_data_before_upgrade #2
+insights.patches.name_workbooks_as_strings
 insights.patches.normalize_workbook #6
 
 [post_model_sync]
@@ -7,10 +8,31 @@ insights.insights.doctype.insights_data_source_v3.patches.copy_data_sources #v4
 insights.insights.doctype.insights_table_v3.patches.force_sync_tables #5
 insights.patches.enable_data_store
 insights.insights.doctype.insights_data_source_v3.patches.set_type
-execute:frappe.db.set_single_value("Insights Settings", "apply_user_permissions", 1) #2
 insights.patches.migrate_warehouse_tables_to_schemas
 insights.patches.fix_table_link_names
 insights.patches.backfill_query_references
 execute:frappe.db.set_single_value("Insights Settings", "allow_download", 1)
-insights.patches.requalify_workbook_templates
 insights.patches.strip_default_schema_from_table_names
+insights.patches.hash_invitation_keys
+insights.patches.backfill_permission_user
+insights.patches.backfill_table_columns
+insights.patches.set_visibility_from_is_public
+insights.patches.run_public_charts_as_owner
+insights.patches.repair_sankey_value_aggregation
+insights.patches.retire_chart_query_cache
+# re-run: the first pass left a chart-level direction flag and short option lists
+insights.patches.normalize_number_card_comparisons #2
+# after the comparisons are normalized: a reading's comparison decides how tall its cell is
+insights.patches.resize_dashboard_cells
+insights.patches.split_number_cells
+insights.patches.close_dashboard_layout_gaps
+# after the number card patches: this one mints a reading's id, which those patches read
+insights.patches.normalize_chart_configs
+insights.patches.set_visibility_from_org_shares
+insights.patches.retire_site_apply_user_permissions
+insights.patches.retire_content_permission_user
+insights.patches.copy_cross_workbook_query_sources
+insights.patches.number_duplicate_folder_titles
+insights.patches.reshape_member_shares
+insights.patches.delete_orphaned_variable_secrets
+insights.patches.set_max_export_rows

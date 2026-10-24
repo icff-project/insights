@@ -1,11 +1,10 @@
-import { call } from 'frappe-ui'
+import { call, toast } from 'frappe-ui'
 import { __ } from '../translation'
-import { useTelemetry } from 'frappe-ui/frappe'
-import { computed, InjectionKey, reactive, toRefs } from 'vue'
+import { useTelemetry } from '../telemetry'
+import { computed, reactive, toRefs } from 'vue'
 import useChart, { newChart } from '../charts/chart'
 import useDashboard, { newDashboard } from '../dashboard/dashboard'
 import {
-	copy,
 	copyToClipboard,
 	getUniqueId,
 	safeJSONParse,
@@ -15,10 +14,11 @@ import {
 } from '../helpers'
 import { confirmDialog } from '../helpers/confirm_dialog'
 import useDocumentResource from '../helpers/resource'
-import { createToast } from '../helpers/toasts'
+import { getLinkedQueries } from '../query/linked_queries'
 import useQuery, { newQuery } from '../query/query'
 import router from '../router'
 import session from '../session'
+import type { Operation } from '../types/query.types'
 import type {
 	InsightsWorkbook,
 	WorkbookSharePermission as WorkbookUserPermission,
@@ -44,7 +44,7 @@ function makeWorkbook(name: string) {
 	wheneverChanges(
 		() => workbook.doc.queries.map((q) => q.name),
 		() => workbook.doc.queries.forEach((q) => useQuery(q.name)),
-		{ deep: true }
+		{ deep: true },
 	)
 
 	function setActiveTab(type: 'query' | 'chart' | 'dashboard', name: string) {
@@ -56,14 +56,22 @@ function makeWorkbook(name: string) {
 		return regex.test(url)
 	}
 
-	async function addQuery() {
+	type QuerySeed = {
+		title?: string
+		operations?: Operation[]
+		use_live_connection?: boolean
+	}
+	async function addQuery(seed: QuerySeed = {}) {
 		const query = newQuery()
-		query.doc.title = 'Query ' + (workbook.doc.queries.length + 1)
+		query.doc.title = seed.title || 'Query ' + (workbook.doc.queries.length + 1)
 		query.doc.workbook = workbook.doc.name
-		query.doc.use_live_connection = true
+		query.doc.use_live_connection = seed.use_live_connection ?? true
 		query.doc.sort_order = workbook.doc.queries.length
 		query.doc.folder = null
-		query.insert().then(() => {
+		if (seed.operations) {
+			query.doc.operations = seed.operations
+		}
+		return query.insert().then(() => {
 			workbook.doc.queries.push({
 				name: query.doc.name,
 				title: query.doc.title,
@@ -71,25 +79,15 @@ function makeWorkbook(name: string) {
 				folder: null,
 			})
 			setActiveTab('query', query.doc.name)
+			return query
 		})
 	}
 
 	function removeQuery(name: string) {
-		function _remove() {
-			const idx = workbook.doc.queries.findIndex((row) => row.name === name)
-			if (idx === -1) return
-
-			const query = useQuery(name)
-			waitUntil(() => query.isloaded).then(() => query.delete())
-
-			openNext('query', idx)
-			workbook.doc.queries.splice(idx, 1)
-		}
-
 		confirmDialog({
 			title: __('Delete Query'),
 			message: __('Are you sure you want to delete this query?'),
-			onSuccess: _remove,
+			onSuccess: () => removeItem('query', useQuery(name)),
 		})
 	}
 
@@ -116,21 +114,10 @@ function makeWorkbook(name: string) {
 	}
 
 	function removeChart(chartName: string) {
-		function _remove() {
-			const idx = workbook.doc.charts.findIndex((row) => row.name === chartName)
-			if (idx === -1) return
-
-			const chart = useChart(chartName)
-			waitUntil(() => chart.isloaded).then(() => chart.delete())
-
-			openNext('chart', idx)
-			workbook.doc.charts.splice(idx, 1)
-		}
-
 		confirmDialog({
 			title: __('Delete Chart'),
 			message: __('Are you sure you want to delete this chart?'),
-			onSuccess: _remove,
+			onSuccess: () => removeItem('chart', useChart(chartName)),
 		})
 	}
 
@@ -149,24 +136,36 @@ function makeWorkbook(name: string) {
 	}
 
 	function removeDashboard(dashboardName: string) {
-		function _remove() {
-			const idx = workbook.doc.dashboards.findIndex((row) => row.name === dashboardName)
-			if (idx === -1) return
-
-			const dashboard = useDashboard(dashboardName)
-			waitUntil(() => dashboard.isloaded).then(() => dashboard.delete())
-
-			openNext('dashboard', idx)
-			workbook.doc.dashboards.splice(idx, 1)
-		}
-
 		confirmDialog({
 			title: __('Delete Dashboard'),
 			message: __('Are you sure you want to delete this dashboard?'),
-			onSuccess: _remove,
+			onSuccess: () => removeItem('dashboard', useDashboard(dashboardName)),
 		})
 	}
 
+	// Remove the row only after the server deletes the document. The server can
+	// refuse, for example when a desk document shows it. The author then stays
+	// where they were.
+	async function removeItem(
+		type: 'query' | 'chart' | 'dashboard',
+		item: { name: string; isloaded: boolean; delete: () => Promise<void> },
+	) {
+		await waitUntil(() => item.isloaded)
+		await item.delete()
+
+		const rows = {
+			query: workbook.doc.queries,
+			chart: workbook.doc.charts,
+			dashboard: workbook.doc.dashboards,
+		}[type]
+		const idx = rows.findIndex((row) => row.name === item.name)
+		if (idx === -1) return
+		rows.splice(idx, 1)
+		openNext(type, idx)
+	}
+
+	// Called after the row at `idx` is spliced out, so `idx` now holds the row
+	// that took its place — the next tab of the same type, or the last one.
 	function openNext(type: 'query' | 'chart' | 'dashboard', idx: number) {
 		const items = {
 			query: workbook.doc.queries,
@@ -174,16 +173,17 @@ function makeWorkbook(name: string) {
 			dashboard: workbook.doc.dashboards,
 		}[type]
 
-		let nextIndex = idx + 1
+		const next = items[Math.min(idx, items.length - 1)]
+		if (next) {
+			setActiveTab(type, next.name)
+			return
+		}
 
-		if (nextIndex >= items.length) {
-			nextIndex = 0
-		}
-		if (nextIndex < 0) {
-			nextIndex = items.length - 1
-		}
-		if (nextIndex >= 0 && nextIndex < items.length) {
-			setActiveTab(type, items[nextIndex].name)
+		// The last chart or dashboard is gone. A workbook always holds a query,
+		// so that is the tab to land on rather than a route with no document.
+		const query = workbook.doc.queries[0]
+		if (query) {
+			setActiveTab('query', query.name)
 			return
 		}
 
@@ -200,7 +200,8 @@ function makeWorkbook(name: string) {
 				user_permissions: permissions.user_permissions.map((p: any) => {
 					return {
 						email: p.user,
-						full_name: p.full_name,
+						full_name: p.full_name || p.user,
+						user_image: p.user_image,
 						access: p.read ? (p.write ? 'edit' : 'view') : undefined,
 					}
 				}),
@@ -225,23 +226,20 @@ function makeWorkbook(name: string) {
 					write: p.access === 'edit',
 				}
 			}),
-		}).catch(showErrorToast)
+		})
 	}
 
 	function duplicate() {
 		confirmDialog({
 			title: __('Duplicate Workbook'),
 			message: __(
-				'Duplicating this workbook will create a new workbook and copy all queries, charts and dashboards to it. Do you want to continue?'
+				'Duplicating this workbook will create a new workbook and copy all queries, charts and dashboards to it. Do you want to continue?',
 			),
 			onSuccess: () => {
 				workbook
 					.call('duplicate')
 					.then((name: any) => {
-						createToast({
-							message: __('Workbook duplicated successfully'),
-							variant: 'success',
-						})
+						toast.success(__('Workbook duplicated successfully'))
 						window.location.href = router.resolve({
 							name: 'Workbook',
 							params: { workbook_name: name },
@@ -259,10 +257,7 @@ function makeWorkbook(name: string) {
 			onSuccess: () => {
 				workbook.call('import_query', { query }).then((name) => {
 					workbook.load().then(() => {
-						createToast({
-							message: __('Query imported successfully'),
-							variant: 'success',
-						})
+						toast.success(__('Query imported successfully'))
 						setActiveTab('query', name)
 					})
 				})
@@ -277,10 +272,7 @@ function makeWorkbook(name: string) {
 			onSuccess: () => {
 				workbook.call('import_chart', { chart }).then((name) => {
 					workbook.load().then(() => {
-						createToast({
-							message: __('Chart imported successfully'),
-							variant: 'success',
-						})
+						toast.success(__('Chart imported successfully'))
 						setActiveTab('chart', name)
 					})
 				})
@@ -297,11 +289,7 @@ function makeWorkbook(name: string) {
 			title: __('Delete Workbook'),
 			message: __('Are you sure you want to delete this workbook?'),
 			theme: 'red',
-			onSuccess: () => {
-				workbook.delete().then(() => {
-					router.replace('/workbook')
-				})
-			},
+			onSuccess: () => workbook.delete().then(() => router.replace('/workbook')),
 		})
 	}
 
@@ -343,7 +331,7 @@ function makeWorkbook(name: string) {
 	async function moveItemToFolder(
 		itemType: 'query' | 'chart',
 		itemName: string,
-		folderName?: string
+		folderName?: string,
 	) {
 		const method = 'insights.api.workbooks.move_item_to_folder'
 		return call(method, {
@@ -356,7 +344,7 @@ function makeWorkbook(name: string) {
 	}
 
 	async function updateSortOrder(
-		items: Array<{ type: string; name: string; sort_order: number; folder?: string | null }>
+		items: Array<{ type: string; name: string; sort_order: number; folder?: string | null }>,
 	) {
 		const method = 'insights.api.workbooks.update_sort_orders'
 		return call(method, { workbook: workbook.name, items }).catch(showErrorToast)
@@ -406,7 +394,17 @@ function makeWorkbook(name: string) {
 }
 
 export type Workbook = ReturnType<typeof makeWorkbook>
-export const workbookKey = Symbol() as InjectionKey<Workbook>
+
+// Where this open came from. The page has two signals: the history entry it was
+// pushed from, and the referrer when there is none. Every other arrival is a
+// link.
+function openedVia() {
+	const back = router.options.history.state.back
+	if (back === '/workbook') return 'list'
+	if (back === '/') return 'recent'
+	if (!back && document.referrer.startsWith(`${location.origin}/app`)) return 'desk'
+	return 'link'
+}
 
 export function getWorkbookResource(name: string) {
 	const doctype = 'Insights Workbook'
@@ -433,14 +431,17 @@ export function getWorkbookResource(name: string) {
 		},
 	})
 
-	workbook.onAfterLoad(() => workbook.call('track_view').catch(() => {}))
+	workbook.onAfterLoad(() =>
+		// eslint-disable-next-line no-restricted-syntax -- a view count is telemetry, and the reader has nothing to act on if it fails
+		workbook.call('track_view', { via: openedVia() }).catch(() => {}),
+	)
 	wheneverChanges(
 		() => workbook.doc.read_only,
 		() => {
 			if (workbook.doc.read_only) {
 				workbook.autoSave = false
 			}
-		}
+		},
 	)
 	return workbook
 }
@@ -448,31 +449,4 @@ export function getWorkbookResource(name: string) {
 export function newWorkbookName() {
 	const unique_id = getUniqueId()
 	return `new-workbook-${unique_id}`
-}
-
-export function getLinkedQueries(query_name: string, _visited: Set<string> = new Set()): string[] {
-	if (_visited.has(query_name)) return []
-	_visited.add(query_name)
-
-	const query = useQuery(query_name)
-	const linkedQueries = new Set<string>()
-
-	if (!query.isloaded) {
-		console.log('Operations not loaded yet for query', query_name)
-	}
-
-	const operations = copy(query.currentOperations)
-	if (query.activeEditIndex > -1) {
-		operations.splice(query.activeEditIndex)
-	}
-
-	operations.forEach((op) => {
-		if ('table' in op && 'type' in op.table && op.table.type === 'query') {
-			linkedQueries.add(op.table.query_name)
-		}
-	})
-
-	linkedQueries.forEach((q) => getLinkedQueries(q, _visited).forEach((q) => linkedQueries.add(q)))
-
-	return Array.from(linkedQueries)
 }

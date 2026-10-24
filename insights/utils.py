@@ -96,6 +96,26 @@ def deep_convert_dict_to_dict(d):
     return d
 
 
+def refuse_delete_while_linked(doc, taken: tuple[str, ...]) -> None:
+    """Refuse a delete frappe's link check will refuse, before `on_trash` changes anything.
+
+    frappe asks after `on_trash`, and a refusal there leaves every change the
+    hook made to whoever commits next. `taken` names the doctypes the hook
+    deletes or rewrites itself, so their links never refuse.
+    """
+    from frappe.model.delete_doc import (
+        get_dynamic_linked_docs,
+        get_linked_docs,
+        raise_link_exists_exception,
+    )
+
+    for link in (*get_linked_docs(doc), *get_dynamic_linked_docs(doc)):
+        if link["reference_doctype"] not in taken:
+            raise_link_exists_exception(
+                doc, link["reference_doctype"], link["reference_docname"], link.get("at_position", "")
+            )
+
+
 def create_execution_log(sql, time_taken=0, query_name=None, data_store=False):
     frappe.get_doc(
         {
@@ -150,6 +170,35 @@ def anonymize_data(df, columns_to_anonymize, prefix_by_column=None):
     return df
 
 
+# A leading control character can pass a formula past an importer that trims
+# before it parses, so it counts as a trigger. `@`, `+` and `-` also start
+# ordinary data — a handle, a phone number, a text-column negative — so they are
+# quoted only when the value has the characters a formula needs to call.
+FORMULA_TRIGGERS = ("=", "\t", "\r", "\n")
+AMBIGUOUS_STARTS = ("@", "+", "-")
+CALL_CHARACTERS = frozenset("|!()")
+
+
+def quote_formula(value):
+    """Prefix a value a spreadsheet would evaluate, so it reads as text."""
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(FORMULA_TRIGGERS) or (
+        value.startswith(AMBIGUOUS_STARTS) and CALL_CHARACTERS.intersection(value)
+    ):
+        return "'" + value
+    return value
+
+
+def as_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the frame with every cell safe to write to a sheet.
+
+    Values only. A header is the alias the query's author chose, and rewriting
+    it would rename the columns of every export something downstream parses.
+    """
+    return df.map(quote_formula)
+
+
 def xls_to_df(file_path: str) -> list[pd.DataFrame]:
     file_extension = file_path.split(".")[-1].lower()
     if file_extension != "xlsx" or file_extension != "xls":
@@ -192,3 +241,28 @@ class InsightsPageRenderer(TemplatePage):
         allowed_origins = [origin.strip() for origin in allowed_origins]
         allowed_origins = " ".join(allowed_origins)
         self.headers["Content-Security-Policy"] = f"frame-ancestors 'self' {allowed_origins}"
+
+
+def get_currency_symbols(codes) -> dict:
+    """The symbol for each currency code.
+
+    Codes arrive with each result, so nothing is sent ahead. A code with no Currency
+    row, or with no symbol, prints as the code, the way fmt_money does.
+    `hide_currency_symbol` empties every symbol.
+    """
+    codes = {code for code in codes if code}
+    if not codes or frappe.utils.cint(frappe.defaults.get_global_default("hide_currency_symbol")):
+        return {}
+
+    # one read: a measure pointed at the wrong column names as many codes as rows
+    rows = frappe.db.get_all(
+        "Currency", filters={"name": ("in", list(codes))}, fields=["name", "symbol", "symbol_on_right"]
+    )
+    known = {row.name: row for row in rows}
+    return {
+        code: {
+            "symbol": (known[code].symbol if code in known else None) or code,
+            "symbol_on_right": bool(known[code].symbol_on_right) if code in known else False,
+        }
+        for code in codes
+    }

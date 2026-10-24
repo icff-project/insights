@@ -28,6 +28,7 @@ def get_primary_data_source():
     if not site_db.host or not site_db.port:
         site_db.host = frappe.conf.db_host
         site_db.port = frappe.conf.db_port
+        site_db.unix_socket = frappe.conf.db_socket
 
     if not site_db.host:
         site_db.host = "localhost"
@@ -52,6 +53,7 @@ def get_primary_data_source():
 
 def get_replica_data_source():
     data_source = get_primary_data_source()
+    data_source.unix_socket = None
 
     if frappe.conf.replica_host:
         data_source.host = frappe.conf.replica_host
@@ -76,8 +78,7 @@ def get_sitedb_connection():
             replica = get_replica_data_source()
             return get_frappedb_connection(replica)
         except Exception:
-            # If replica fails, fall back to primary
-            pass
+            pass  # nosemgrep - the primary holds the same data as the replica
 
     primary = get_primary_data_source()
     return get_frappedb_connection(primary)
@@ -92,7 +93,7 @@ def is_frappe_db(data_source):
         db.con.close()
         return len(res) > 0
     except Exception:
-        return False
+        return False  # nosemgrep - what the probe cannot read is not Frappe; it never passes on PostgreSQL
 
 
 def get_frappedb_table_links(data_source):

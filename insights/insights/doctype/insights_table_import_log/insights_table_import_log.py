@@ -37,10 +37,15 @@ class InsightsTableImportLog(Document):
             self.output = ""
         self.output += message + "\n"
         self.db_update()
-        commit and frappe.db.commit()
+        commit and frappe.db.commit()  # nosemgrep - other sessions read the log while the import runs
 
     @frappe.whitelist()
     def mark_as_failed(self):
         frappe.only_for("System Manager")
         self.status = "Failed"
         self.db_update()
+
+
+def on_doctype_update():
+    # A table's newest import is looked up on every scheduler tick.
+    frappe.db.add_index("Insights Table Import Log", ["data_source", "table_name", "started_at"])

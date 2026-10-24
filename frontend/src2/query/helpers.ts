@@ -52,6 +52,7 @@ import {
 	PivotWiderArgs,
 	QueryResult,
 	QueryResultColumn,
+	QueryResultRow,
 	QueryTableArgs,
 	Remove,
 	RemoveArgs,
@@ -63,6 +64,8 @@ import {
 	SourceArgs,
 	SQL,
 	SQLArgs,
+	SQLColumn,
+	SQLColumnArgs,
 	Summarize,
 	SummarizeArgs,
 	Table,
@@ -100,6 +103,16 @@ export const expression = (expression: string): Expression => ({
 	expression,
 })
 
+// the server's summarize carries a money measure's currency code under this name;
+// `CARRIED_CURRENCY_SUFFIX` in ibis_utils.py must match
+export const currencyColumnName = (measure_name: string) => `${measure_name}__currency`
+
+// `undefined`: the measure names no column. `null`: the row mixes currencies.
+export function getRowCurrency(row: any, measure_name: string): string | null | undefined {
+	const key = currencyColumnName(measure_name)
+	return key in (row || {}) ? row[key] ?? null : undefined
+}
+
 // export const window_operation = (options: WindowOperationArgs): WindowOperation => ({
 // 	type: 'window_operation',
 // 	operation: options.operation,
@@ -108,21 +121,55 @@ export const expression = (expression: string): Expression => ({
 // 	order_by: options.order_by,
 // })
 
+// Here rather than in the query store: the island renders a result without ever
+// building a query, and importing the store for a blank one pulls the whole
+// execution path — socket, queue, autosave — into the island bundle.
+// A function and not a const: every reset of a shared const hands out the same
+// `rows`, `columns` and `formattedRows` arrays and the same import-time
+// `lastExecutedAt`, so two results that were reset are one result.
+export function emptyResult(): QueryResult {
+	return {
+		executedSQL: '',
+		totalRowCount: 0,
+		rows: [],
+		formattedRows: [],
+		columns: [],
+		columnOptions: [],
+		timeTaken: 0,
+		lastExecutedAt: new Date(),
+	}
+}
+
 export function getFormattedRows(result: QueryResult, operations: Operation[]) {
+	return formatResultRows(result, getColumnGranularity(operations))
+}
+
+// The grain a date column was grouped by, per column. A reader never receives
+// the operations, so the server sends it this map instead — same shape, so the
+// formatting below stays one implementation.
+export function getColumnGranularity(operations: Operation[]) {
+	// The last of each kind: a later operation regroups what an earlier one grouped, so
+	// its grain is the one the result columns have.
+	const reversed = [...operations].reverse()
+	const summarize_step = reversed.find((op) => op.type === 'summarize')
+	const pivot_step = reversed.find((op) => op.type === 'pivot_wider')
+
+	const granularity: Record<string, string> = {}
+	const dimensions = [...(summarize_step?.dimensions || []), ...(pivot_step?.rows || [])]
+	dimensions.forEach((dim) => {
+		if (dim.granularity && !granularity[dim.dimension_name]) {
+			granularity[dim.dimension_name] = dim.granularity
+		}
+	})
+	return granularity
+}
+
+export function formatResultRows(result: QueryResult, granularityByColumn: Record<string, string>) {
 	if (!result.rows?.length || !result.columns?.length) return []
 
 	const rows = copy(result.rows)
 	const columns = copy(result.columns)
-	const _operations = copy(operations)
-	const summarize_step = _operations.reverse().find((op) => op.type === 'summarize')
-	const pivot_step = _operations.reverse().find((op) => op.type === 'pivot_wider')
-
-	const getGranularity = (column_name: string) => {
-		const dim =
-			summarize_step?.dimensions.find((dim) => dim.dimension_name === column_name) ||
-			pivot_step?.rows.find((dim) => dim.dimension_name === column_name)
-		return dim ? dim.granularity : null
-	}
+	const getGranularity = (column_name: string) => granularityByColumn[column_name] || null
 
 	const formattedRows = rows.map((row) => {
 		const formattedRow = { ...row }
@@ -151,7 +198,82 @@ export function getFormattedRows(result: QueryResult, operations: Operation[]) {
 	})
 	return formattedRows
 }
+/**
+ * The row `formatResultRows` produced this one from. A surface that renders the
+ * formatted rows — a table — reports the row it rendered, and everything downstream
+ * of a click reads the raw values, so the crossing happens once, here.
+ *
+ * The two are parallel arrays, so the raw row is the formatted one's position.
+ * A row from anywhere else has no position and reads as nothing.
+ */
+export function rawRowOf(
+	result: QueryResult,
+	formattedRow: QueryResultRow,
+): QueryResultRow | undefined {
+	return positionsIn(result).get(formattedRow)
+}
+
+/**
+ * Where each formatted row sits, built once per set of formatted rows.
+ *
+ * A table asks this per cell, so a scan of the rows for each of them is the
+ * whole result walked once a cell. Keyed on `formattedRows` rather than on the
+ * result: an execution writes fresh rows into the same result object, so a
+ * result-keyed map would answer the next run from the last run's rows. The map
+ * is held weakly, so it goes when the rows do.
+ */
+const positions = new WeakMap<QueryResultRow[], Map<QueryResultRow, QueryResultRow>>()
+function positionsIn(result: QueryResult) {
+	let found = positions.get(result.formattedRows)
+	if (!found) {
+		found = new Map()
+		result.formattedRows.forEach((formatted, index) => {
+			if (result.rows[index]) found!.set(formatted, result.rows[index])
+		})
+		positions.set(result.formattedRows, found)
+	}
+	return found
+}
+
+/** How a date reads in a cell, a tooltip or a header — spelled out in full. */
+const LONG_DATE_FORMATS: Record<string, string> = {
+	second: 'MMMM D, YYYY h:mm:ss A',
+	minute: 'MMMM D, YYYY h:mm A',
+	hour: 'MMMM D, YYYY h:00 A',
+	day: 'MMMM D, YYYY',
+	week: 'MMM Do, YYYY',
+	month: 'MMMM, YYYY',
+	year: 'YYYY',
+	quarter: '[Q]Q, YYYY',
+}
+
+/**
+ * How the same date reads on an axis. A category axis shows a label per column,
+ * so a spelled-out month is dropped by the overlap rule and the reader is left
+ * with a bare grid. Everything is abbreviated, and the year is kept: a category
+ * has no neighbors to read it against.
+ */
+const AXIS_DATE_FORMATS: Record<string, string> = {
+	second: 'MMM D, YYYY h:mm:ss A',
+	minute: 'MMM D, YYYY h:mm A',
+	hour: 'MMM D, YYYY h A',
+	day: 'MMM D, YYYY',
+	week: 'MMM D, YYYY',
+	month: 'MMM YYYY',
+	year: 'YYYY',
+	quarter: '[Q]Q YYYY',
+}
+
 export function getFormattedDate(date: string, granularity: string) {
+	return formatDateBy(date, granularity, LONG_DATE_FORMATS)
+}
+
+/** `getFormattedDate`, abbreviated for an axis tick. */
+export function getAxisDate(date: string, granularity: string) {
+	return formatDateBy(date, granularity, AXIS_DATE_FORMATS)
+}
+
+function formatDateBy(date: string, granularity: string, formats: Record<string, string>) {
 	if (!date) return ''
 
 	const isTimeOnlyValue = /^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(date)
@@ -170,7 +292,7 @@ export function getFormattedDate(date: string, granularity: string) {
 
 	if (granularity === 'fiscal_year') {
 		const d = dayjs(date)
-		const fiscalYearStart = session.user.fiscal_year_start
+		const fiscalYearStart = session.site.fiscal_year_start
 		const fiscalStartMonth = dayjs(fiscalYearStart).month()
 		const fiscalStartDay = dayjs(fiscalYearStart).date()
 
@@ -181,19 +303,8 @@ export function getFormattedDate(date: string, granularity: string) {
 		return `FY ${startYear}-${String(endYear).slice(-2)}`
 	}
 
-	const dayjsFormat: Record<string, string> = {
-		second: 'MMMM D, YYYY h:mm:ss A',
-		minute: 'MMMM D, YYYY h:mm A',
-		hour: 'MMMM D, YYYY h:00 A',
-		day: 'MMMM D, YYYY',
-		week: 'MMM Do, YYYY',
-		month: 'MMMM, YYYY',
-		year: 'YYYY',
-		quarter: '[Q]Q, YYYY',
-	}
-
-	if (!dayjsFormat[granularity]) return date
-	return dayjs(date).format(dayjsFormat[granularity])
+	if (!formats[granularity]) return date
+	return dayjs(date).format(formats[granularity])
 }
 
 export function getMeasures(columns: QueryResultColumn[]): Measure[] {
@@ -351,6 +462,18 @@ export const query_operation_types = {
 			return `${op.new_name}`
 		},
 	},
+	// No popover entry: the v2 migrator is the only writer.
+	sql_column: {
+		label: __('SQL column (from v2)'),
+		type: 'sql_column',
+		icon: ScrollText,
+		color: 'gray',
+		class: 'text-ink-gray-5 bg-surface-gray-2',
+		init: (args: SQLColumnArgs): SQLColumn => ({ type: 'sql_column', ...args }),
+		getDescription: (op: SQLColumn) => {
+			return `${op.new_name}`
+		},
+	},
 	summarize: {
 		label: __('Summarize'),
 		type: 'summarize',
@@ -445,6 +568,7 @@ export const cast = query_operation_types.cast.init
 export const filter = query_operation_types.filter.init
 export const filter_group = query_operation_types.filter_group.init
 export const mutate = query_operation_types.mutate.init
+export const sql_column = query_operation_types.sql_column.init
 export const summarize = query_operation_types.summarize.init
 export const pivot_wider = query_operation_types.pivot_wider.init
 export const order_by = query_operation_types.order_by.init
@@ -452,59 +576,3 @@ export const limit = query_operation_types.limit.init
 export const custom_operation = query_operation_types.custom_operation.init
 export const sql = query_operation_types.sql.init
 export const code = query_operation_types.code.init
-
-// ─── Inline column filter utilities ──────────────────────────────────────────
-
-// Operators checked longest-first so ">=" is not mistaken for ">"
-const NUMERIC_OPERATORS = ['>=', '<=', '!=', '>', '<', '='] as const
-export type NumericOperator = (typeof NUMERIC_OPERATORS)[number]
-
-export type ParsedFilter =
-	| { kind: 'numeric'; operator: NumericOperator; num: number }
-	| { kind: 'text'; text: string }
-
-/**
- * Parse a raw filter string (e.g. ">= 100", "foo") into a structured form.
- * Returns null when the string is empty or the numeric part cannot be parsed.
- */
-export function parseFilterString(filterStr: string): ParsedFilter | null {
-	if (!filterStr) return null
-
-	const op = NUMERIC_OPERATORS.find((o) => filterStr.startsWith(o))
-	if (op) {
-		const rest = filterStr.slice(op.length).trim()
-		const num = Number(rest)
-		if (rest === '' || isNaN(num)) return null
-		return { kind: 'numeric', operator: op, num }
-	}
-
-	return { kind: 'text', text: filterStr }
-}
-
-/**
- * Test whether a single cell value matches a parsed filter.
- * Used for client-side (in-memory) filtering.
- */
-export function matchesFilter(value: any, parsed: ParsedFilter): boolean {
-	if (parsed.kind === 'numeric') {
-		const num = Number(value)
-		switch (parsed.operator) {
-			case '>':
-				return num > parsed.num
-			case '<':
-				return num < parsed.num
-			case '>=':
-				return num >= parsed.num
-			case '<=':
-				return num <= parsed.num
-			case '=':
-				return num === parsed.num
-			case '!=':
-				return num !== parsed.num
-		}
-	}
-	// text: case-insensitive substring match
-	return String(value ?? '')
-		.toLowerCase()
-		.includes(parsed.text.toLowerCase())
-}

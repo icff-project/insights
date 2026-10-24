@@ -1,10 +1,11 @@
 <script setup lang="tsx">
 import { watchDebounced } from '@vueuse/core'
 import { __ } from '../translation'
-import { Avatar, ListView } from 'frappe-ui'
+import { Avatar } from 'frappe-ui'
+import { ListView } from 'frappe-ui/experimental'
 import { Plus } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
-import Checkbox from '../components/Checkbox.vue'
+import NumberInput from '../components/NumberInput.vue'
 import { copy } from '../helpers'
 import session from '../session'
 import CreateTeamDialog from '../teams/CreateTeamDialog.vue'
@@ -90,20 +91,20 @@ const editTeam = ref<Team | null>(null)
 		</SettingItem>
 
 		<SettingItem
-			label="Apply User Permissions"
-			description="Apply restrictions based on roles and user permissions defined on this site. Only applicable for site data source."
-		>
-			<Toggle v-model="settings.doc.apply_user_permissions" />
-		</SettingItem>
-
-		<SettingItem
 			label="Allow Data Download"
 			description="Allow users to download query results as CSV or Excel. A user can download only if both this toggle is on and its export permission is granted on the query. When disabled, only admins can download data."
 		>
 			<Toggle v-model="settings.doc.allow_download" />
 		</SettingItem>
 
-		<div class="flex w-full flex-1 flex-col gap-3 overflow-auto">
+		<SettingItem
+			label="Export Row Limit"
+			description="Maximum number of rows in a CSV or Excel download. Set to 0 for no limit. Default is 1,00,000"
+		>
+			<NumberInput v-model="settings.doc.max_export_rows" class="w-28" />
+		</SettingItem>
+
+		<div class="flex w-full flex-col gap-3">
 			<SettingItem
 				label="Teams"
 				description="Create teams to group users and manage permissions."
@@ -120,7 +121,7 @@ const editTeam = ref<Team | null>(null)
 					</template>
 				</Button>
 			</SettingItem>
-			<ListView class="h-full" v-bind="listOptions"> </ListView>
+			<ListView v-bind="listOptions"> </ListView>
 		</div>
 	</div>
 
