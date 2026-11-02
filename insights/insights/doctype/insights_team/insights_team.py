@@ -163,6 +163,11 @@ class InsightsTeam(Document):
 
 def update_admin_team(user, method=None):
     try:
+        if user.flags.in_delete:
+            # delete_doc runs on_change too, and the deleted user must not be added back
+            remove_from_teams(user.name)
+            return
+
         if not user.has_value_changed("roles"):
             return
 
@@ -182,13 +187,31 @@ def update_admin_team(user, method=None):
                     "user": user.name,
                 },
             )
+            frappe.clear_document_cache("Insights Team", "Admin")
         if is_admin and user.name not in admin_team_members():
-            team = frappe.get_cached_doc("Insights Team", "Admin")
+            # not the cached copy: saving a stale one would drop the members it lacks
+            team = frappe.get_doc("Insights Team", "Admin")
             team.append("team_members", {"user": user.name})
             team.save(ignore_permissions=True)
 
     except Exception:
         frappe.log_error(title="update_admin_team")
+
+
+def remove_from_teams(user):
+    teams = frappe.get_all(
+        "Insights Team Member",
+        filters={"user": user, "parenttype": "Insights Team"},
+        pluck="parent",
+        distinct=True,
+    )
+    if not teams:
+        return
+
+    frappe.db.delete("Insights Team Member", {"user": user, "parenttype": "Insights Team"})
+    for team in teams:
+        frappe.clear_document_cache("Insights Team", team)
+    clear_cache()
 
 
 def clear_cache():
